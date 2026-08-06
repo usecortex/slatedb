@@ -660,7 +660,7 @@ impl DbReaderInner {
         };
 
         let replay_options = WalReplayOptions {
-            sst_batch_size: 4,
+            sst_batch_size: reader_options.wal_replay_concurrency,
             max_memtable_bytes: reader_options.max_memtable_bytes as usize,
             sst_iter_options,
             // Skip entries that we already have in `imm_memtable` (that might be above last_l0_seq).
@@ -812,6 +812,9 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 
 impl DbReader {
     fn validate_options(mode: DbReaderMode, options: &DbReaderOptions) -> Result<(), SlateDBError> {
+        if options.wal_replay_concurrency == 0 {
+            return Err(SlateDBError::InvalidSSTBatchSize(0));
+        }
         if mode != DbReaderMode::ManagedCheckpoint {
             return Ok(());
         }
@@ -1673,6 +1676,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn reader_rejects_zero_wal_replay_concurrency() {
+        let options = DbReaderOptions {
+            wal_replay_concurrency: 0,
+            ..DbReaderOptions::default()
+        };
+        assert!(matches!(
+            DbReader::validate_options(DbReaderMode::ManagedCheckpoint, &options),
+            Err(SlateDBError::InvalidSSTBatchSize(0))
+        ));
+    }
 
     #[tokio::test]
     async fn should_get_value_from_db() {
