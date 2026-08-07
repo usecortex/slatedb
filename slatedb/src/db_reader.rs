@@ -44,6 +44,7 @@ use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock as AsyncRwLock};
 use uuid::Uuid;
 
 pub(crate) const DB_READER_TASK_NAME: &str = "manifest_poller";
+pub(crate) const DEFAULT_WAL_REPLAY_CONCURRENCY: usize = 4;
 
 /// Determines how a [`DbReader`] chooses and refreshes the database state it reads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -94,6 +95,7 @@ struct DbReaderInner {
     manifest_store: Arc<ManifestStore>,
     table_store: Arc<TableStore>,
     options: DbReaderOptions,
+    wal_replay_concurrency: usize,
     mode: DbReaderMode,
     state: RwLock<Arc<ReaderState>>,
     snapshot_gate: Arc<AsyncRwLock<()>>,
@@ -155,6 +157,7 @@ impl DbReaderInner {
         manifest_store: Arc<ManifestStore>,
         table_store: Arc<TableStore>,
         options: DbReaderOptions,
+        wal_replay_concurrency: usize,
         mode: DbReaderMode,
         merge_operator: Option<MergeOperatorType>,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
@@ -184,6 +187,7 @@ impl DbReaderInner {
                 replay_new_wals,
                 Arc::clone(&table_store),
                 &options,
+                wal_replay_concurrency,
                 segment_extractor.as_ref(),
             )
             .await?,
@@ -224,6 +228,7 @@ impl DbReaderInner {
             manifest_store,
             table_store,
             options,
+            wal_replay_concurrency,
             mode,
             state,
             snapshot_gate: Arc::new(AsyncRwLock::new(())),
@@ -384,6 +389,7 @@ impl DbReaderInner {
             let (last_wal_id, last_committed_seq) = Self::replay_wal_into(
                 Arc::clone(&self.table_store),
                 &self.options,
+                self.wal_replay_concurrency,
                 current_state.core(),
                 &mut imm_memtable,
                 true,
@@ -459,6 +465,7 @@ impl DbReaderInner {
             !self.options.skip_wal_replay,
             Arc::clone(&self.table_store),
             &self.options,
+            self.wal_replay_concurrency,
             self.segment_extractor.as_ref(),
         )
         .await
@@ -472,11 +479,13 @@ impl DbReaderInner {
         replay_new_wals: bool,
         table_store: Arc<TableStore>,
         options: &DbReaderOptions,
+        wal_replay_concurrency: usize,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
     ) -> Result<ReaderState, SlateDBError> {
         let (last_wal_id, last_committed_seq) = Self::replay_wal_into(
             Arc::clone(&table_store),
             options,
+            wal_replay_concurrency,
             &manifest.core,
             &mut imm_memtable,
             replay_new_wals,
@@ -628,6 +637,7 @@ impl DbReaderInner {
     async fn replay_wal_into(
         table_store: Arc<TableStore>,
         reader_options: &DbReaderOptions,
+        wal_replay_concurrency: usize,
         core: &ManifestCore,
         into_tables: &mut VecDeque<Arc<ImmutableMemtable>>,
         replay_new_wals: bool,
@@ -660,7 +670,7 @@ impl DbReaderInner {
         };
 
         let replay_options = WalReplayOptions {
-            sst_batch_size: 4,
+            sst_batch_size: wal_replay_concurrency,
             max_memtable_bytes: reader_options.max_memtable_bytes as usize,
             sst_iter_options,
             // Skip entries that we already have in `imm_memtable` (that might be above last_l0_seq).
@@ -811,7 +821,14 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 }
 
 impl DbReader {
-    fn validate_options(mode: DbReaderMode, options: &DbReaderOptions) -> Result<(), SlateDBError> {
+    fn validate_options(
+        mode: DbReaderMode,
+        options: &DbReaderOptions,
+        wal_replay_concurrency: usize,
+    ) -> Result<(), SlateDBError> {
+        if wal_replay_concurrency == 0 {
+            return Err(SlateDBError::InvalidSSTBatchSize(0));
+        }
         if mode != DbReaderMode::ManagedCheckpoint {
             return Ok(());
         }
@@ -916,11 +933,12 @@ impl DbReader {
         merge_operator: Option<MergeOperatorType>,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
         options: DbReaderOptions,
+        wal_replay_concurrency: usize,
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
         recorder: slatedb_common::metrics::MetricsRecorderHelper,
     ) -> Result<Self, SlateDBError> {
-        Self::validate_options(mode, &options)?;
+        Self::validate_options(mode, &options, wal_replay_concurrency)?;
 
         let manifest =
             StoredManifest::load(Arc::clone(&manifest_store), system_clock.clone()).await?;
@@ -937,6 +955,7 @@ impl DbReader {
                 manifest_store,
                 table_store,
                 options,
+                wal_replay_concurrency,
                 mode,
                 merge_operator,
                 segment_extractor,
@@ -1634,7 +1653,7 @@ fn has_not_found_object_store_error(err: &(dyn std::error::Error + 'static)) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{DbReaderMessage, ManifestPoller, ReaderState};
+    use super::{DbReaderMessage, ManifestPoller, ReaderState, DEFAULT_WAL_REPLAY_CONCURRENCY};
     use crate::clock::MonotonicClock;
     use crate::config::{
         CheckpointOptions, CheckpointScope, FlushOptions, FlushType, MergeOptions, PutOptions,
@@ -1673,6 +1692,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn reader_rejects_zero_wal_replay_concurrency() {
+        let options = DbReaderOptions::default();
+        assert!(matches!(
+            DbReader::validate_options(DbReaderMode::ManagedCheckpoint, &options, 0),
+            Err(SlateDBError::InvalidSSTBatchSize(0))
+        ));
+    }
 
     #[tokio::test]
     async fn should_get_value_from_db() {
@@ -1753,6 +1781,7 @@ mod tests {
             None,
             None,
             DbReaderOptions::default(),
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             test_provider.system_clock.clone(),
             test_provider.rand.clone(),
             slatedb_common::metrics::MetricsRecorderHelper::noop(),
@@ -2117,6 +2146,7 @@ mod tests {
                 manifest_poll_interval: Duration::from_secs(60 * 60),
                 ..DbReaderOptions::default()
             },
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             test_provider.system_clock.clone(),
             test_provider.rand.clone(),
             slatedb_common::metrics::MetricsRecorderHelper::noop(),
@@ -2311,6 +2341,7 @@ mod tests {
                 checkpoint_lifetime: Duration::from_millis(1000),
                 ..DbReaderOptions::default()
             },
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             DbReaderMode::ManagedCheckpoint,
             None,
             None,
@@ -2406,6 +2437,7 @@ mod tests {
                 checkpoint_lifetime: Duration::from_millis(1000),
                 ..DbReaderOptions::default()
             },
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             DbReaderMode::ManagedCheckpoint,
             None,
             None,
@@ -2644,6 +2676,7 @@ mod tests {
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             &core,
             &mut into_tables,
             false,
@@ -2709,6 +2742,7 @@ mod tests {
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             &core,
             &mut into_tables,
             false,
@@ -2761,6 +2795,7 @@ mod tests {
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
             &reader_options,
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             &core,
             &mut into_tables,
             false,
@@ -2797,6 +2832,7 @@ mod tests {
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             &core,
             &mut into_tables,
             true,
@@ -2828,6 +2864,7 @@ mod tests {
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             &core,
             &mut into_tables,
             true,
@@ -2874,6 +2911,7 @@ mod tests {
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             &core,
             &mut into_tables,
             true,
@@ -3154,6 +3192,7 @@ mod tests {
                 merge_operator,
                 None,
                 options,
+                DEFAULT_WAL_REPLAY_CONCURRENCY,
                 self.system_clock.clone(),
                 self.rand.clone(),
                 slatedb_common::metrics::MetricsRecorderHelper::noop(),
@@ -3343,6 +3382,7 @@ mod tests {
                 skip_wal_replay: true,
                 ..DbReaderOptions::default()
             },
+            wal_replay_concurrency: DEFAULT_WAL_REPLAY_CONCURRENCY,
             mode: DbReaderMode::ManagedCheckpoint,
             state: parking_lot::RwLock::new(Arc::new(prior_state)),
             snapshot_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -3430,6 +3470,7 @@ mod tests {
             manifest_store,
             table_store,
             options: DbReaderOptions::default(),
+            wal_replay_concurrency: DEFAULT_WAL_REPLAY_CONCURRENCY,
             mode: DbReaderMode::ManagedCheckpoint,
             state: parking_lot::RwLock::new(Arc::new(prior_state)),
             snapshot_gate: Arc::new(tokio::sync::RwLock::new(())),
