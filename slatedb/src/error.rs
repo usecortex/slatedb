@@ -74,6 +74,9 @@ pub(crate) enum SlateDBError {
     #[error("invalid DB state error")]
     InvalidDBState,
 
+    #[error("cannot close database reader while snapshots are active")]
+    ActiveReaderSnapshots,
+
     #[error("wal store reconfiguration unsupported")]
     WalStoreReconfigurationError,
 
@@ -466,6 +469,13 @@ pub enum ErrorKind {
     /// or drop the operation.
     Data,
 
+    /// No database has been initialized at the requested object-store path.
+    ///
+    /// A caller may treat this as an empty logical database or initialize a new writer. This is
+    /// distinct from [`ErrorKind::Data`], which indicates that persisted state exists but is
+    /// invalid or unavailable in its expected form.
+    DatabaseMissing,
+
     /// An unexpected internal error occurred. Users should not expect to see this error.
     /// Please [open a Github issue](https://github.com/slatedb/slatedb/issues/new?template=bug_report.md&title=Internal+error+returned)
     /// if you receive this error.
@@ -489,6 +499,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::Unavailable => write!(f, "Unavailable error"),
             ErrorKind::Invalid => write!(f, "Invalid error"),
             ErrorKind::Data => write!(f, "Data error"),
+            ErrorKind::DatabaseMissing => write!(f, "Database missing error"),
             ErrorKind::Internal => write!(f, "Internal error"),
         }
     }
@@ -585,6 +596,15 @@ impl Error {
         }
     }
 
+    /// Creates an error indicating that no database exists at the requested path.
+    pub(crate) fn database_missing(msg: String) -> Self {
+        Self {
+            msg,
+            kind: ErrorKind::DatabaseMissing,
+            source: None,
+        }
+    }
+
     /// Creates a new internal error.
     pub fn internal(msg: String) -> Self {
         Self {
@@ -665,6 +685,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::EmptySegmentPrefix { .. } => Error::invalid(msg),
             SlateDBError::InvalidClockTick { .. } => Error::invalid(msg),
             SlateDBError::InvalidDeletion => Error::invalid(msg),
+            SlateDBError::ActiveReaderSnapshots => Error::invalid(msg),
             SlateDBError::MergeOperatorError(err) => Error::invalid(msg).with_source(Box::new(err)),
             SlateDBError::MergeOperatorMissing => Error::invalid(msg),
             SlateDBError::IncompatibleMergeTtls { .. } => Error::invalid(msg),
@@ -756,5 +777,12 @@ mod tests {
         let public_err = Error::from(err);
 
         assert_eq!(public_err.kind(), ErrorKind::Unavailable);
+    }
+
+    #[test]
+    fn missing_latest_transactional_object_remains_a_data_error() {
+        let public_err = Error::from(SlateDBError::LatestTransactionalObjectVersionMissing);
+
+        assert_eq!(public_err.kind(), ErrorKind::Data);
     }
 }

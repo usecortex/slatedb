@@ -812,6 +812,18 @@ impl Db {
         Ok(snapshot)
     }
 
+    /// Create a snapshot pinned to the latest sequence that is both remotely
+    /// durable and committed for reader visibility.
+    ///
+    /// Unlike [`Self::snapshot`], the returned sequence never names a write
+    /// that is committed in memory but still waiting for its WAL to reach
+    /// object storage. This is useful when every read from the snapshot uses
+    /// [`crate::config::DurabilityLevel::Remote`].
+    pub async fn durable_snapshot(&self) -> Result<Arc<DbSnapshot>, crate::Error> {
+        self.inner.check_closed()?;
+        Ok(DbSnapshot::new_durable(self.inner.clone()))
+    }
+
     /// Get a value from the database with default read options.
     ///
     /// The `Bytes` object returned contains a slice of an entire
@@ -2011,6 +2023,15 @@ impl Db {
     /// See [`DbMetadataOps::status`].
     pub fn status(&self) -> DbStatus {
         <Self as DbMetadataOps>::status(self)
+    }
+
+    /// Returns the highest WAL SST id durably flushed by this writer.
+    ///
+    /// This is an object-store durability frontier, not a manifest-compaction
+    /// frontier. Readers can use it as an inclusive upper bound and still
+    /// filter WAL entries by a pinned snapshot sequence.
+    pub fn last_flushed_wal_id(&self) -> u64 {
+        self.inner.wal_observer.status().last_flushed_wal_id
     }
 }
 
@@ -4275,7 +4296,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_flushes_memtable_after_max_wal_flushes() {
-        const MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: u64 = 4096;
+        const MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: u64 = 128;
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = "/tmp/test_flush_memtable_max_wal_flushes";

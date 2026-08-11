@@ -21,6 +21,16 @@ impl DbSnapshot {
     pub(crate) fn new(db_inner: Arc<DbInner>, seq: Option<u64>) -> Arc<Self> {
         let (snapshot_id, started_seq) = db_inner.snapshot_manager.new_snapshot(seq);
 
+        Self::from_registration(db_inner, snapshot_id, started_seq)
+    }
+
+    pub(crate) fn new_durable(db_inner: Arc<DbInner>) -> Arc<Self> {
+        let (snapshot_id, started_seq) = db_inner.snapshot_manager.new_durable_snapshot();
+
+        Self::from_registration(db_inner, snapshot_id, started_seq)
+    }
+
+    fn from_registration(db_inner: Arc<DbInner>, snapshot_id: Uuid, started_seq: u64) -> Arc<Self> {
         Arc::new(Self {
             snapshot_id,
             started_seq,
@@ -265,7 +275,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStore;
     use crate::oracle::Oracle;
-    use crate::{Db, Error};
+    use crate::{Db, Error, IsolationLevel};
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
     use std::future::Future;
@@ -780,9 +790,18 @@ mod tests {
         // Sleep for 1 second to ensure the put is in the memtable but not committed
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // At this point the data is in the memtable but not committed; create the snapshot
+        // At this point the data is in the memtable and its WAL has reached remote
+        // storage, but the batch is not committed for reader visibility.
+        assert!(
+            db.inner.oracle.last_remote_persisted_seq() > recent_committed_seq,
+            "paused write should reach remote durability before it becomes committed"
+        );
+
+        // Neither snapshot kind may name the uncommitted WAL sequence.
         let snapshot = db.snapshot().await?;
         assert_eq!(snapshot.seq(), recent_committed_seq);
+        let durable_snapshot = db.durable_snapshot().await?;
+        assert_eq!(durable_snapshot.seq(), recent_committed_seq);
 
         // Turn off the failpoint to let the put complete
         fail_parallel::cfg(fp_registry.clone(), "write-batch-pre-commit", "off").unwrap();
@@ -793,9 +812,136 @@ mod tests {
         // Assert the snapshot should not contain the new value
         let snapshot_result = snapshot.get(b"key1").await?;
         assert_eq!(snapshot_result, Some(Bytes::from("value1")));
+        let durable_snapshot_result = durable_snapshot.get(b"key1").await?;
+        assert_eq!(durable_snapshot_result, Some(Bytes::from("value1")));
 
         let db_result = db.get(b"key1").await?;
         assert_eq!(db_result, Some(Bytes::from("value2")));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_sequence_matches_same_key_value_under_concurrent_rewrites(
+    ) -> Result<(), Error> {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open("snapshot_concurrent_rewrites", object_store).await?);
+        let first_txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let first_sequence = first_txn.seqnum() + 1;
+        first_txn.put(b"key", b"present")?;
+        first_txn.put(b"degree", first_sequence.to_be_bytes())?;
+        first_txn.put(b"dirty", first_sequence.to_be_bytes())?;
+        first_txn.put(
+            format!("idempotency/{first_sequence}").as_bytes(),
+            first_sequence.to_be_bytes(),
+        )?;
+        let first = first_txn
+            .commit_with_options(&WriteOptions {
+                await_durable: true,
+                seqnum: first_sequence,
+            })
+            .await?
+            .expect("initial transaction must contain a write");
+        let history = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::from([(
+            first.seqnum(),
+            Some(Bytes::from_static(b"present")),
+        )])));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let writer = {
+            let db = Arc::clone(&db);
+            let history = Arc::clone(&history);
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let delete_txn = db
+                        .begin(IsolationLevel::SerializableSnapshot)
+                        .await
+                        .unwrap();
+                    let delete_sequence = delete_txn.seqnum() + 1;
+                    delete_txn.delete(b"key").unwrap();
+                    delete_txn
+                        .put(b"degree", delete_sequence.to_be_bytes())
+                        .unwrap();
+                    delete_txn
+                        .put(b"dirty", delete_sequence.to_be_bytes())
+                        .unwrap();
+                    delete_txn
+                        .put(
+                            format!("idempotency/{delete_sequence}").as_bytes(),
+                            delete_sequence.to_be_bytes(),
+                        )
+                        .unwrap();
+                    let deleted = delete_txn
+                        .commit_with_options(&WriteOptions {
+                            await_durable: true,
+                            seqnum: delete_sequence,
+                        })
+                        .await
+                        .unwrap()
+                        .expect("delete transaction must contain a write");
+                    history.lock().unwrap().insert(deleted.seqnum(), None);
+                    let insert_txn = db
+                        .begin(IsolationLevel::SerializableSnapshot)
+                        .await
+                        .unwrap();
+                    let insert_sequence = insert_txn.seqnum() + 1;
+                    insert_txn.put(b"key", b"present").unwrap();
+                    insert_txn
+                        .put(b"degree", insert_sequence.to_be_bytes())
+                        .unwrap();
+                    insert_txn
+                        .put(b"dirty", insert_sequence.to_be_bytes())
+                        .unwrap();
+                    insert_txn
+                        .put(
+                            format!("idempotency/{insert_sequence}").as_bytes(),
+                            insert_sequence.to_be_bytes(),
+                        )
+                        .unwrap();
+                    let inserted = insert_txn
+                        .commit_with_options(&WriteOptions {
+                            await_durable: true,
+                            seqnum: insert_sequence,
+                        })
+                        .await
+                        .unwrap()
+                        .expect("insert transaction must contain a write");
+                    history
+                        .lock()
+                        .unwrap()
+                        .insert(inserted.seqnum(), Some(Bytes::from_static(b"present")));
+                }
+            })
+        };
+
+        let read_options = ReadOptions {
+            durability_filter: crate::config::DurabilityLevel::Remote,
+            ..Default::default()
+        };
+        let mut anomalies = Vec::new();
+        for _ in 0..40_000 {
+            let snapshot = db.durable_snapshot().await?;
+            let first_observed = snapshot.get_with_options(b"key", &read_options).await?;
+            tokio::task::yield_now().await;
+            let second_observed = snapshot.get_with_options(b"key", &read_options).await?;
+            let expected = history.lock().unwrap().get(&snapshot.seq()).cloned();
+            if let Some(expected) = expected {
+                if first_observed != expected || second_observed != expected {
+                    anomalies.push((snapshot.seq(), expected, first_observed, second_observed));
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+
+        assert!(
+            anomalies.is_empty(),
+            "{} snapshots contradicted the value committed at their sequence; first \
+             (sequence, expected, first_observed, second_observed)={:?}",
+            anomalies.len(),
+            anomalies.first()
+        );
+        db.close().await?;
         Ok(())
     }
 }

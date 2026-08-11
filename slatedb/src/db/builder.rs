@@ -139,7 +139,7 @@ use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
 use crate::db_cache::{DbCache, DbCacheWrapper, UnownedDbCache};
-use crate::db_reader::{DbReader, DbReaderMode};
+use crate::db_reader::{DbReader, DbReaderMode, DEFAULT_WAL_REPLAY_CONCURRENCY};
 use crate::db_status::{ClosedResultWriter, DbStatusManager};
 use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
@@ -414,10 +414,9 @@ impl<P: Into<Path>> DbBuilder<P> {
                 "invalid configuration: l0_flush_parallelism must be at least 1".into(),
             ));
         }
-        if self.settings.max_wal_flushes_before_l0_flush < 4096 {
+        if self.settings.max_wal_flushes_before_l0_flush == 0 {
             return Err(crate::Error::invalid(
-                "invalid configuration: max_wal_flushes_before_l0_flush must be at least 4096"
-                    .into(),
+                "invalid configuration: max_wal_flushes_before_l0_flush must be at least 1".into(),
             ));
         }
 
@@ -1603,6 +1602,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     options: DbReaderOptions,
+    wal_replay_concurrency: usize,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
@@ -1622,6 +1622,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             filter_policies: default_filter_policies(),
             segment_extractor: None,
             options: DbReaderOptions::default(),
+            wal_replay_concurrency: DEFAULT_WAL_REPLAY_CONCURRENCY,
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
@@ -1662,6 +1663,18 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
     /// Sets the options to use for the reader.
     pub fn with_options(mut self, options: DbReaderOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Sets the maximum number of immutable WAL SSTs opened concurrently while
+    /// the reader is established or refreshed.
+    ///
+    /// Raising this value can reduce cold-reader latency for databases with a
+    /// long uncompacted WAL tail at the cost of additional object-store
+    /// requests and temporary replay memory. The default is 4, preserving the
+    /// historical replay behavior.
+    pub fn with_wal_replay_concurrency(mut self, concurrency: usize) -> Self {
+        self.wal_replay_concurrency = concurrency;
         self
     }
 
@@ -1793,6 +1806,11 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         let latest_manifest =
             StoredManifest::try_load(Arc::clone(&manifest_store), self.system_clock.clone())
                 .await?;
+        if latest_manifest.is_none() {
+            return Err(crate::Error::database_missing(format!(
+                "no database initialized at object-store path {path}"
+            )));
+        }
         if let Some(latest_manifest) = &latest_manifest {
             latest_manifest
                 .db_state()
@@ -1848,6 +1866,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             self.merge_operator,
             self.segment_extractor,
             self.options,
+            self.wal_replay_concurrency,
             self.system_clock,
             self.rand,
             recorder,
@@ -2233,13 +2252,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_db_builder_rejects_low_max_wal_flushes_before_l0_flush() {
+    async fn test_db_builder_rejects_zero_max_wal_flushes_before_l0_flush() {
         let result = crate::Db::builder(
-            "test_db_builder_rejects_low_max_wal_flushes_before_l0_flush",
+            "test_db_builder_rejects_zero_max_wal_flushes_before_l0_flush",
             Arc::new(InMemory::new()),
         )
         .with_settings(Settings {
-            max_wal_flushes_before_l0_flush: 4095,
+            max_wal_flushes_before_l0_flush: 0,
             ..Settings::default()
         })
         .build()
@@ -2253,7 +2272,7 @@ mod tests {
         assert!(matches!(err.kind(), ErrorKind::Invalid));
         assert!(
             err.to_string()
-                .contains("max_wal_flushes_before_l0_flush must be at least 4096"),
+                .contains("max_wal_flushes_before_l0_flush must be at least 1"),
             "unexpected error: {err}"
         );
     }
