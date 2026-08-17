@@ -39,7 +39,7 @@ use crate::transaction_manager::IsolationLevel;
 use crate::CloseReason;
 use log::{debug, info, trace, warn};
 use parking_lot::RwLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::batch::WriteBatch;
 use crate::batch_write::{BatchWriterMessage, WriteBatchRequest, WRITE_BATCH_TASK_NAME};
@@ -296,15 +296,32 @@ impl DbInner {
             txn,
         });
 
+        // Three separately observable waits. Timed individually because the
+        // sum alone cannot tell a caller whether a slow commit was flush
+        // backpressure, queueing behind the single writer, or the object-store
+        // round trip -- and those have completely different remedies.
+        let backpressure_started = Instant::now();
         self.maybe_apply_backpressure().await?;
+        self.db_stats
+            .write_backpressure_delay_micros
+            .increment(backpressure_started.elapsed().as_micros() as u64);
+
         self.write_notifier.send(batch_msg)?;
 
         // TODO: this can be modified as awaiting the last_durable_seq watermark & fatal error.
 
+        let apply_started = Instant::now();
         let (write_handle, mut durable_watcher) = rx.await??;
+        self.db_stats
+            .write_queue_apply_micros
+            .increment(apply_started.elapsed().as_micros() as u64);
 
         if options.await_durable {
+            let durable_started = Instant::now();
             durable_watcher.await_value().await?;
+            self.db_stats
+                .write_durable_wait_micros
+                .increment(durable_started.elapsed().as_micros() as u64);
         }
 
         Ok(write_handle)

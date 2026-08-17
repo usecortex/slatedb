@@ -37,6 +37,28 @@ pub const SST_FILTER_NEGATIVE_COUNT: &str = db_stat_name!("sst_filter_negative_c
 ///               / `MEMTABLE_WRITE_BYTES`
 pub const MEMTABLE_WRITE_BYTES: &str = db_stat_name!("memtable_write_bytes");
 
+/// A committing write waits on three things in `Db::write_with_options`, and
+/// only the sum of them was observable before: a caller timing `commit()` saw
+/// one number and could not tell which wait produced it. These three counters
+/// are microsecond sums over committed writes, so dividing each by
+/// [`WRITE_BATCH_COUNT`] attributes an average commit.
+///
+/// Time blocked in write backpressure, waiting for unflushed WAL and immutable
+/// memtable bytes to fall back under their limits. Non-zero means writes are
+/// arriving faster than they can be flushed.
+pub const WRITE_BACKPRESSURE_DELAY_MICROS: &str =
+    db_stat_name!("write_backpressure_delay_micros");
+/// Time between handing the batch to the single background writer and that
+/// writer returning the handle: queueing behind other writers, the SSI
+/// conflict check, and the memtable apply. This is the serialisation point, so
+/// it grows with write concurrency rather than with batch size.
+pub const WRITE_QUEUE_APPLY_MICROS: &str = db_stat_name!("write_queue_apply_micros");
+/// Time awaiting durability once the batch is applied — the WAL flush reaching
+/// object storage. Charged only when `await_durable` is set, which is the only
+/// mode a write-authoritative graph shard may open in. Expect roughly one
+/// object-store round trip.
+pub const WRITE_DURABLE_WAIT_MICROS: &str = db_stat_name!("write_durable_wait_micros");
+
 /// Label key distinguishing filter metrics for point lookups from those for
 /// prefix scans. Value is one of [`FILTER_KIND_POINT`] or
 /// [`FILTER_KIND_PREFIX`].
@@ -67,6 +89,9 @@ pub(crate) struct DbStatsInner {
     pub(crate) merge_operator_read_operands: Arc<dyn CounterFn>,
     pub(crate) merge_operator_flush_operands: Arc<dyn CounterFn>,
     pub(crate) memtable_write_bytes: Arc<dyn CounterFn>,
+    pub(crate) write_backpressure_delay_micros: Arc<dyn CounterFn>,
+    pub(crate) write_queue_apply_micros: Arc<dyn CounterFn>,
+    pub(crate) write_durable_wait_micros: Arc<dyn CounterFn>,
 }
 
 #[derive(Clone)]
@@ -133,6 +158,11 @@ impl DbStats {
                 .labels(&[("op", "flush")])
                 .register(),
             write_batch_count: recorder.counter(WRITE_BATCH_COUNT).register(),
+            write_backpressure_delay_micros: recorder
+                .counter(WRITE_BACKPRESSURE_DELAY_MICROS)
+                .register(),
+            write_queue_apply_micros: recorder.counter(WRITE_QUEUE_APPLY_MICROS).register(),
+            write_durable_wait_micros: recorder.counter(WRITE_DURABLE_WAIT_MICROS).register(),
             write_ops: recorder.counter(WRITE_OPS).register(),
             total_mem_size_bytes: recorder.gauge(TOTAL_MEM_SIZE_BYTES).register(),
             l0_sst_count: recorder.gauge(L0_SST_COUNT).register(),
