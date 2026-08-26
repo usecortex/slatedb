@@ -7,6 +7,7 @@ use object_store::path::Path;
 use object_store::{Attributes, ObjectMeta};
 use rand::{distr::Alphanumeric, Rng};
 use slatedb_common::clock::SystemClock;
+use slatedb_common::metrics::HistogramFn;
 use slatedb_common::DbRand;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -71,6 +72,7 @@ impl FileHandleCache {
     fn get_or_open(
         &self,
         path: &std::path::Path,
+        stats: &CachedObjectStoreStats,
     ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
         let mut cache = self.inner.lock().expect("lock should not be poisoned");
         if let Some(handle) = cache.get(path) {
@@ -81,7 +83,13 @@ impl FileHandleCache {
             cache.pop(path);
         }
 
-        let file = match std::fs::File::open(path) {
+        // Only a handle-cache miss reaches open(2). On a network filesystem
+        // this is a metadata round trip, so it is worth its own histogram
+        // rather than being folded into the read latency.
+        let opened = record_latency(&*stats.object_store_cache_file_open_duration, || {
+            std::fs::File::open(path)
+        });
+        let file = match opened {
             Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
@@ -121,6 +129,34 @@ impl FileHandleCache {
     }
 }
 
+/// Monotonic timer used purely to measure elapsed I/O latency.
+///
+/// SlateDB's [`SystemClock`] abstraction exists for wall-clock timestamps that
+/// deterministic simulation needs to control; it is the wrong tool for timing a
+/// syscall, and `instrumented_object_store` reaches for `Instant` for the same
+/// reason. The allow is scoped to this one function so the module-wide ban
+/// still holds everywhere else.
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+#[inline]
+fn io_timer_now() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
+/// Time `f`, record the elapsed wall-clock seconds into `hist`, and return
+/// whatever `f` returned.
+///
+/// Two `Instant::now()` calls (a `clock_gettime` vDSO read) plus a handful of
+/// relaxed atomics per observation. That is well under a microsecond, against
+/// syscalls that cost tens of microseconds even on local NVMe, so this stays
+/// negligible on a cache serving tens of thousands of reads per second.
+#[inline]
+fn record_latency<T>(hist: &dyn HistogramFn, f: impl FnOnce() -> T) -> T {
+    let start = io_timer_now();
+    let out = f();
+    hist.record(start.elapsed().as_secs_f64());
+    out
+}
+
 /// Cross-platform positional read. Reads exactly `buf.len()` bytes at `offset`
 /// without altering the file cursor, allowing concurrent readers on the same fd.
 fn read_exact_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
@@ -153,6 +189,7 @@ pub struct FsCacheStorage {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    stats: Arc<CachedObjectStoreStats>,
 }
 
 impl FsCacheStorage {
@@ -171,7 +208,7 @@ impl FsCacheStorage {
                 root_folder.clone(),
                 max_cache_size_bytes,
                 scan_interval,
-                stats,
+                stats.clone(),
                 system_clock,
                 rand.clone(),
                 file_handle_cache.clone(),
@@ -183,6 +220,7 @@ impl FsCacheStorage {
             evictor,
             rand,
             file_handle_cache,
+            stats,
         }
     }
 
@@ -206,6 +244,7 @@ impl LocalCacheStorage for FsCacheStorage {
             part_size,
             rand: self.rand.clone(),
             file_handle_cache: self.file_handle_cache.clone(),
+            stats: self.stats.clone(),
         })
     }
 
@@ -230,6 +269,7 @@ pub(crate) struct FsCacheEntry {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    stats: Arc<CachedObjectStoreStats>,
 }
 
 impl FsCacheEntry {
@@ -255,9 +295,19 @@ impl FsCacheEntry {
         // blocking task.
         // see https://github.com/slatedb/slatedb/pull/1342
         let invalidate_path = path.clone();
+        let stats = self.stats.clone();
         #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || {
             let tmp_path = tmp_path.as_path();
+
+            // The three timers below are deliberately kept apart. `fsync` is
+            // the term that changes character on a network filesystem, where
+            // it becomes a commit round trip instead of a page-cache flush,
+            // and the namespace operations (`create_dir_all`, `open`,
+            // `rename`) are the other NFS/EFS cost. Averaging any of them into
+            // a single "write duration" would hide exactly the signal this
+            // instrumentation exists to capture.
+            let metadata_start = io_timer_now();
             // ensure the parent folder exists
             if let Some(folder_path) = tmp_path.parent() {
                 std::fs::create_dir_all(folder_path).map_err(wrap_io_err)?;
@@ -269,9 +319,24 @@ impl FsCacheEntry {
                 .truncate(true)
                 .open(tmp_path)
                 .map_err(wrap_io_err)?;
-            file.write_all(&buf).map_err(wrap_io_err)?;
-            file.sync_all().map_err(wrap_io_err)?;
-            std::fs::rename(tmp_path, path).map_err(wrap_io_err)
+            let mut metadata_elapsed = metadata_start.elapsed();
+
+            record_latency(&*stats.object_store_cache_write_duration, || {
+                file.write_all(&buf)
+            })
+            .map_err(wrap_io_err)?;
+            record_latency(&*stats.object_store_cache_fsync_duration, || {
+                file.sync_all()
+            })
+            .map_err(wrap_io_err)?;
+
+            let rename_start = io_timer_now();
+            let renamed = std::fs::rename(tmp_path, path).map_err(wrap_io_err);
+            metadata_elapsed += rename_start.elapsed();
+            stats
+                .object_store_cache_metadata_duration
+                .record(metadata_elapsed.as_secs_f64());
+            renamed
         })
         .await?
         .map_err(wrap_io_err)?;
@@ -352,9 +417,10 @@ impl LocalCacheEntry for FsCacheEntry {
         // see https://github.com/slatedb/slatedb/pull/1342
         let file_cache = self.file_handle_cache.clone();
         let this_part_path = part_path.clone();
+        let stats = self.stats.clone();
         #[allow(clippy::disallowed_methods)]
         let result = tokio::task::spawn_blocking(move || {
-            let file = match file_cache.get_or_open(&this_part_path) {
+            let file = match file_cache.get_or_open(&this_part_path, &stats) {
                 Ok(Some(f)) => f,
                 Ok(None) => return Ok(None),
                 Err(err) => return Err(wrap_io_err(err)),
@@ -363,8 +429,10 @@ impl LocalCacheEntry for FsCacheEntry {
             // Use positional I/O (pread) — no seek required, and safe for
             // concurrent readers sharing the same Arc<File>.
             let mut buffer = vec![0; range_in_part.len()];
-            read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
-                .map_err(wrap_io_err)?;
+            record_latency(&*stats.object_store_cache_part_read_duration, || {
+                read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
+            })
+            .map_err(wrap_io_err)?;
             Ok(Some(Bytes::from(buffer)))
         })
         .await
@@ -470,20 +538,28 @@ impl LocalCacheEntry for FsCacheEntry {
         // blocking task.
         let file_cache = self.file_handle_cache.clone();
         let this_head_path = head_path.clone();
+        let stats = self.stats.clone();
         #[allow(clippy::disallowed_methods)]
         let result = tokio::task::spawn_blocking(move || {
-            let file = match file_cache.get_or_open(&this_head_path) {
+            let file = match file_cache.get_or_open(&this_head_path, &stats) {
                 Ok(Some(f)) => f,
                 Ok(None) => return Ok(None),
                 Err(err) => return Err(wrap_io_err(err)),
             };
 
+            // fstat and the pread are timed together: both are part of "read
+            // one head file", and on a network filesystem the stat is as
+            // likely to be the expensive half as the read is.
+            let head_read_start = io_timer_now();
             let metadata = file.file().metadata().map_err(wrap_io_err)?;
             let head_size_bytes = metadata.len() as usize;
 
             // Use positional read from offset 0 to read the entire file.
             let mut buffer = vec![0u8; head_size_bytes];
             read_exact_at_offset(file.file(), &mut buffer, 0).map_err(wrap_io_err)?;
+            stats
+                .object_store_cache_head_read_duration
+                .record(head_read_start.elapsed().as_secs_f64());
 
             let content = String::from_utf8(buffer).map_err(|e| {
                 wrap_io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -1166,11 +1242,17 @@ async fn delete_cache_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cached_object_store::stats::{CACHE_BYTES, CACHE_KEYS, EVICTED_BYTES, EVICTED_KEYS};
+    use crate::cached_object_store::stats::{
+        CACHE_BYTES, CACHE_KEYS, EVICTED_BYTES, EVICTED_KEYS, FILE_OPEN_DURATION, FSYNC_DURATION,
+        HEAD_READ_DURATION, IO_LATENCY_BOUNDARIES, METADATA_DURATION, PART_READ_DURATION,
+        WRITE_DURATION,
+    };
     use crate::test_utils::gen_rand_bytes;
     use filetime::FileTime;
     use slatedb_common::clock::DefaultSystemClock;
-    use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder, MetricsRecorderHelper};
+    use slatedb_common::metrics::{
+        lookup_metric, DefaultMetricsRecorder, MetricValue, MetricsRecorderHelper,
+    };
     use std::{io::Write, sync::atomic::Ordering, time::SystemTime};
 
     fn gen_rand_file(
@@ -1445,5 +1527,87 @@ mod tests {
         // cache_keys should be updated after eviction
         let keys = lookup_metric(&recorder, CACHE_KEYS).unwrap();
         assert!(keys >= 1, "expected cache_keys >= 1, got {keys}");
+    }
+    /// Read back a histogram's `(count, sum, boundaries)` from a recorder snapshot.
+    fn lookup_histogram(recorder: &DefaultMetricsRecorder, name: &str) -> (u64, f64, Vec<f64>) {
+        let metrics = recorder.snapshot();
+        let metric = metrics
+            .by_name(name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("histogram {name} was never registered"));
+        match &metric.value {
+            MetricValue::Histogram {
+                count,
+                sum,
+                boundaries,
+                ..
+            } => (*count, *sum, boundaries.clone()),
+            other => panic!("expected {name} to be a histogram, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_should_record_disk_cache_io_latencies() {
+        // given: an fs cache storage wired to a real (non-noop) recorder
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_io_latency_")
+            .tempdir()
+            .unwrap();
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), Default::default());
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(CachedObjectStoreStats::new(&helper)),
+            Arc::new(DefaultSystemClock::default()),
+            Arc::new(DbRand::default()),
+            16,
+        );
+
+        let location = Path::from("test/io_latency.sst");
+        let entry = storage.entry(&location, 1024);
+
+        // when: a part is written (metadata + write + fsync) and read back
+        entry.save_part(0, gen_rand_bytes(1024)).await.unwrap();
+        let read_back = entry.read_part(0, 0..1024).await.unwrap();
+        assert!(read_back.is_some());
+
+        // and: a head is written and read back
+        let meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: DefaultSystemClock::default().now(),
+            size: 1024,
+            e_tag: None,
+            version: None,
+        };
+        let attrs = Attributes::new();
+        entry.save_head((&meta, &attrs)).await.unwrap();
+        assert!(entry.read_head().await.unwrap().is_some());
+
+        // then: every write-side term is recorded, and fsync is its own series
+        for name in [WRITE_DURATION, FSYNC_DURATION, METADATA_DURATION] {
+            let (count, sum, boundaries) = lookup_histogram(&recorder, name);
+            assert!(count >= 2, "expected {name} count >= 2, got {count}");
+            assert!(sum >= 0.0, "expected {name} sum >= 0, got {sum}");
+            assert_eq!(
+                boundaries, IO_LATENCY_BOUNDARIES,
+                "{name} should use the disk-cache I/O boundaries"
+            );
+        }
+
+        // and: every read-side term is recorded
+        for name in [PART_READ_DURATION, HEAD_READ_DURATION, FILE_OPEN_DURATION] {
+            let (count, _, boundaries) = lookup_histogram(&recorder, name);
+            assert!(count >= 1, "expected {name} count >= 1, got {count}");
+            assert_eq!(
+                boundaries, IO_LATENCY_BOUNDARIES,
+                "{name} should use the disk-cache I/O boundaries"
+            );
+        }
+
+        // and: the counter/gauge stats are untouched by this change
+        assert_eq!(lookup_metric(&recorder, CACHE_KEYS), Some(0));
     }
 }
