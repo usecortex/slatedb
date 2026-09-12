@@ -5,6 +5,7 @@ use log::{debug, error, warn};
 use lru::LruCache;
 use object_store::path::Path;
 use object_store::{Attributes, ObjectMeta};
+use parking_lot::Mutex as SyncMutex;
 use rand::{distr::Alphanumeric, Rng};
 use slatedb_common::clock::SystemClock;
 use slatedb_common::DbRand;
@@ -537,7 +538,10 @@ enum EntryAccess {
     Delete,
 }
 
-type FsCacheEvictorWork = (std::path::PathBuf, EntryAccess);
+type FsCacheEvictorReadWork = (std::path::PathBuf, usize);
+type FsCacheEvictorMutationWork = (std::path::PathBuf, EntryAccess);
+const EVICTOR_READ_QUEUE_CAPACITY: usize = 4096;
+const EVICTOR_MUTATION_QUEUE_CAPACITY: usize = 256;
 // Minimum time between aggregated "evictor queue is full" warnings.
 const QUEUE_FULL_LOG_INTERVAL_MS: i64 = 30_000;
 
@@ -549,11 +553,16 @@ struct FsCacheEvictor {
     root_folder: std::path::PathBuf,
     max_cache_size_bytes: usize,
     scan_interval: Option<Duration>,
-    tx: tokio::sync::mpsc::Sender<FsCacheEvictorWork>,
-    rx: Mutex<Option<tokio::sync::mpsc::Receiver<FsCacheEvictorWork>>>,
+    read_tx: tokio::sync::mpsc::Sender<FsCacheEvictorReadWork>,
+    read_rx: Mutex<Option<tokio::sync::mpsc::Receiver<FsCacheEvictorReadWork>>>,
+    mutation_tx: tokio::sync::mpsc::Sender<FsCacheEvictorMutationWork>,
+    mutation_rx: Mutex<Option<tokio::sync::mpsc::Receiver<FsCacheEvictorMutationWork>>>,
+    pending_reads: Arc<SyncMutex<HashSet<std::path::PathBuf>>>,
     started: AtomicBool,
-    queue_full_count: AtomicU64,
-    last_queue_full_log_ms: AtomicI64,
+    read_queue_full_count: AtomicU64,
+    last_read_queue_full_log_ms: AtomicI64,
+    mutation_queue_full_count: AtomicU64,
+    last_mutation_queue_full_log_ms: AtomicI64,
     background_evict_handle: OnceCell<tokio::task::JoinHandle<()>>,
     background_scan_handle: OnceCell<tokio::task::JoinHandle<()>>,
     stats: Arc<CachedObjectStoreStats>,
@@ -572,16 +581,23 @@ impl FsCacheEvictor {
         rand: Arc<DbRand>,
         file_handle_cache: FileHandleCache,
     ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let (read_tx, read_rx) = tokio::sync::mpsc::channel(EVICTOR_READ_QUEUE_CAPACITY);
+        let (mutation_tx, mutation_rx) =
+            tokio::sync::mpsc::channel(EVICTOR_MUTATION_QUEUE_CAPACITY);
         Self {
             root_folder,
             scan_interval,
             max_cache_size_bytes,
-            tx,
-            rx: Mutex::new(Some(rx)),
+            read_tx,
+            read_rx: Mutex::new(Some(read_rx)),
+            mutation_tx,
+            mutation_rx: Mutex::new(Some(mutation_rx)),
+            pending_reads: Arc::new(SyncMutex::new(HashSet::new())),
             started: AtomicBool::new(false),
-            queue_full_count: AtomicU64::new(0),
-            last_queue_full_log_ms: AtomicI64::new(i64::MIN),
+            read_queue_full_count: AtomicU64::new(0),
+            last_read_queue_full_log_ms: AtomicI64::new(i64::MIN),
+            mutation_queue_full_count: AtomicU64::new(0),
+            last_mutation_queue_full_log_ms: AtomicI64::new(i64::MIN),
             background_evict_handle: OnceCell::new(),
             background_scan_handle: OnceCell::new(),
             stats,
@@ -600,8 +616,18 @@ impl FsCacheEvictor {
             self.file_handle_cache.clone(),
         ));
 
-        let guard = self.rx.lock();
-        let rx = guard.await.take().expect("evictor already started");
+        let read_rx = self
+            .read_rx
+            .lock()
+            .await
+            .take()
+            .expect("evictor already started");
+        let mutation_rx = self
+            .mutation_rx
+            .lock()
+            .await
+            .take()
+            .expect("evictor already started");
 
         self.started.store(true, Ordering::Release);
 
@@ -619,7 +645,9 @@ impl FsCacheEvictor {
         self.background_evict_handle
             .set(tokio::spawn(Self::background_evict(
                 inner,
-                rx,
+                read_rx,
+                mutation_rx,
+                self.pending_reads.clone(),
                 self.system_clock.clone(),
             )))
             .ok();
@@ -631,29 +659,108 @@ impl FsCacheEvictor {
 
     async fn background_evict(
         inner: Arc<FsCacheEvictorInner>,
-        mut rx: tokio::sync::mpsc::Receiver<FsCacheEvictorWork>,
+        mut read_rx: tokio::sync::mpsc::Receiver<FsCacheEvictorReadWork>,
+        mut mutation_rx: tokio::sync::mpsc::Receiver<FsCacheEvictorMutationWork>,
+        pending_reads: Arc<SyncMutex<HashSet<std::path::PathBuf>>>,
         system_clock: Arc<dyn SystemClock>,
     ) {
+        let mut prefer_read = false;
         loop {
-            match rx.recv().await {
-                Some((path, access)) => match access {
-                    EntryAccess::Read(bytes) => {
-                        inner
-                            .track_entry_accessed(path, bytes, system_clock.now(), false)
-                            .await;
+            // Alternate priority after each item. When both queues stay ready,
+            // each makes progress every two iterations; when only one is ready,
+            // it continues without waiting for the other queue.
+            let handled_read = if prefer_read {
+                tokio::select! {
+                    biased;
+                    Some((path, bytes)) = read_rx.recv() => {
+                        Self::process_read(
+                            inner.clone(),
+                            pending_reads.clone(),
+                            path,
+                            bytes,
+                            system_clock.clone(),
+                        )
+                        .await;
+                        true
                     }
-                    EntryAccess::Write(bytes) => {
-                        inner
-                            .track_entry_accessed(path, bytes, system_clock.now(), true)
-                            .await;
+                    Some((path, access)) = mutation_rx.recv() => {
+                        Self::process_mutation(
+                            inner.clone(),
+                            path,
+                            access,
+                            system_clock.clone(),
+                        )
+                        .await;
+                        false
                     }
-                    EntryAccess::Delete => {
-                        inner.delete_entry(path).await;
+                    else => return,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    Some((path, access)) = mutation_rx.recv() => {
+                        Self::process_mutation(
+                            inner.clone(),
+                            path,
+                            access,
+                            system_clock.clone(),
+                        )
+                        .await;
+                        false
                     }
-                },
-                None => return,
-            }
+                    Some((path, bytes)) = read_rx.recv() => {
+                        Self::process_read(
+                            inner.clone(),
+                            pending_reads.clone(),
+                            path,
+                            bytes,
+                            system_clock.clone(),
+                        )
+                        .await;
+                        true
+                    }
+                    else => return,
+                }
+            };
+            prefer_read = !handled_read;
         }
+    }
+
+    async fn process_mutation(
+        inner: Arc<FsCacheEvictorInner>,
+        path: std::path::PathBuf,
+        access: EntryAccess,
+        system_clock: Arc<dyn SystemClock>,
+    ) {
+        match access {
+            EntryAccess::Write(bytes) => {
+                inner
+                    .track_entry_accessed(path, bytes, system_clock.now(), true)
+                    .await;
+            }
+            EntryAccess::Delete => inner.delete_entry(path).await,
+            EntryAccess::Read(_) => unreachable!("read work uses the read queue"),
+        }
+    }
+
+    async fn process_read(
+        inner: Arc<FsCacheEvictorInner>,
+        pending_reads: Arc<SyncMutex<HashSet<std::path::PathBuf>>>,
+        path: std::path::PathBuf,
+        bytes: usize,
+        system_clock: Arc<dyn SystemClock>,
+    ) {
+        // Once dequeued, permit a concurrent access to enqueue a newer update.
+        // This keeps a hot entry's timestamp fresh even if this update waits on
+        // an eviction or rescan already holding the inner tracking lock.
+        pending_reads.lock().remove(&path);
+
+        // Reads and deletes use independent queues. Check existence while
+        // holding the same lock used by deletion and eviction, so a reordered
+        // read cannot recreate accounting after a racy pre-lock check.
+        inner
+            .track_existing_entry_accessed(path, bytes, system_clock.now())
+            .await;
     }
 
     async fn background_scan(
@@ -680,27 +787,77 @@ impl FsCacheEvictor {
             return true;
         }
 
-        match self.tx.try_send((path, access)) {
+        match access {
+            EntryAccess::Read(bytes) => self.track_read(path, bytes),
+            EntryAccess::Write(bytes) => {
+                self.track_mutation(path, EntryAccess::Write(bytes), false)
+                    .await
+            }
+            EntryAccess::Delete => self.track_mutation(path, EntryAccess::Delete, true).await,
+        }
+    }
+
+    fn track_read(&self, path: std::path::PathBuf, bytes: usize) -> bool {
+        {
+            let mut pending = self.pending_reads.lock();
+            if !pending.insert(path.clone()) {
+                return true;
+            }
+        }
+
+        match self.read_tx.try_send((path, bytes)) {
             Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                self.queue_full_count.fetch_add(1, Ordering::AcqRel);
-                let now_ms = self.system_clock.now().timestamp_millis();
-                let last_log_ms = self.last_queue_full_log_ms.load(Ordering::Acquire);
-                if now_ms.saturating_sub(last_log_ms) >= QUEUE_FULL_LOG_INTERVAL_MS
-                    && self
-                        .last_queue_full_log_ms
-                        .compare_exchange(last_log_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    let queue_full_count = self.queue_full_count.swap(0, Ordering::AcqRel);
-                    warn!(
-                        "evictor queue skipped cache write/access event because it was full {} times in the last 30s",
-                        queue_full_count,
-                    );
-                }
+            Err(tokio::sync::mpsc::error::TrySendError::Full((path, _))) => {
+                self.pending_reads.lock().remove(&path);
+                self.record_queue_full(
+                    "read",
+                    &self.read_queue_full_count,
+                    &self.last_read_queue_full_log_ms,
+                );
                 false
             }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed((path, _))) => {
+                self.pending_reads.lock().remove(&path);
+                false
+            }
+        }
+    }
+
+    async fn track_mutation(
+        &self,
+        path: std::path::PathBuf,
+        access: EntryAccess,
+        wait_when_full: bool,
+    ) -> bool {
+        match self.mutation_tx.try_send((path, access)) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(work)) => {
+                self.record_queue_full(
+                    "mutation",
+                    &self.mutation_queue_full_count,
+                    &self.last_mutation_queue_full_log_ms,
+                );
+                if wait_when_full {
+                    self.mutation_tx.send(work).await.is_ok()
+                } else {
+                    false
+                }
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn record_queue_full(&self, queue: &str, count: &AtomicU64, last_log_ms: &AtomicI64) {
+        count.fetch_add(1, Ordering::AcqRel);
+        let now_ms = self.system_clock.now().timestamp_millis();
+        let previous_log_ms = last_log_ms.load(Ordering::Acquire);
+        if now_ms.saturating_sub(previous_log_ms) >= QUEUE_FULL_LOG_INTERVAL_MS
+            && last_log_ms
+                .compare_exchange(previous_log_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let queue_full_count = count.swap(0, Ordering::AcqRel);
+            warn!("evictor {queue} queue was full {queue_full_count} times in the last 30s");
         }
     }
 }
@@ -826,7 +983,42 @@ impl FsCacheEvictorInner {
         accessed_time: DateTime<Utc>,
         evict: bool,
     ) -> usize {
+        self.track_entry_accessed_inner(path, bytes, accessed_time, evict, false)
+            .await
+    }
+
+    async fn track_existing_entry_accessed(
+        &self,
+        path: std::path::PathBuf,
+        bytes: usize,
+        accessed_time: DateTime<Utc>,
+    ) -> usize {
+        self.track_entry_accessed_inner(path, bytes, accessed_time, false, true)
+            .await
+    }
+
+    async fn track_entry_accessed_inner(
+        &self,
+        path: std::path::PathBuf,
+        bytes: usize,
+        accessed_time: DateTime<Utc>,
+        evict: bool,
+        require_existing_file: bool,
+    ) -> usize {
         let _track_guard = self.track_lock.lock().await;
+
+        if require_existing_file {
+            match path.try_exists() {
+                Ok(true) => {}
+                Ok(false) => return 0,
+                Err(error) => {
+                    warn!(
+                        "evictor failed to check a read cache entry [path={path:?}, error={error}]"
+                    );
+                    return 0;
+                }
+            }
+        }
 
         let entry_count = {
             let mut cache_state = self.cache_state.lock().await;
@@ -963,12 +1155,12 @@ impl FsCacheEvictorInner {
     }
 
     async fn delete_entry(&self, path: std::path::PathBuf) {
+        // Serialize physical deletion with read existence checks and accounting.
+        let _track_guard = self.track_lock.lock().await;
         let deleted_entries = delete_cache_entry(path, self.file_handle_cache.clone()).await;
         if deleted_entries.is_empty() {
             return;
         }
-
-        let _track_guard = self.track_lock.lock().await;
 
         // Untrack the deleted entries.
         let entry_count = {
@@ -1227,7 +1419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_evictor_track_entry_accessed_backpressure() {
+    async fn test_evictor_mutation_backpressure() {
         let temp_dir = tempfile::Builder::new()
             .prefix("objstore_cache_test_evictor_backpressure_")
             .tempdir()
@@ -1247,7 +1439,7 @@ mod tests {
         // Simulate started state without a running receiver so the channel can fill.
         evictor.started.store(true, Ordering::Release);
 
-        for idx in 0..100 {
+        for idx in 0..EVICTOR_MUTATION_QUEUE_CAPACITY {
             let accepted = evictor
                 .track_entry_accessed(
                     std::path::PathBuf::from(format!("file{idx}")),
@@ -1261,6 +1453,200 @@ mod tests {
             .track_entry_accessed(std::path::PathBuf::from("overflow"), EntryAccess::Write(1))
             .await;
         assert!(!accepted);
+    }
+
+    #[tokio::test]
+    async fn test_evictor_coalesces_pending_reads() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_evictor_coalesced_reads_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let evictor = FsCacheEvictor::new(
+            temp_dir.path().to_path_buf(),
+            1024,
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        );
+        evictor.started.store(true, Ordering::Release);
+
+        for _ in 0..EVICTOR_READ_QUEUE_CAPACITY * 2 {
+            assert!(
+                evictor
+                    .track_entry_accessed(
+                        std::path::PathBuf::from("hot-file"),
+                        EntryAccess::Read(1),
+                    )
+                    .await
+            );
+        }
+
+        assert_eq!(evictor.read_tx.capacity(), EVICTOR_READ_QUEUE_CAPACITY - 1);
+        assert_eq!(evictor.pending_reads.lock().len(), 1);
+        assert_eq!(evictor.read_queue_full_count.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_evictor_does_not_restore_a_deleted_read() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_evictor_deleted_read_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let inner = Arc::new(FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        ));
+        let path = temp_dir.path().join("deleted-file");
+        let pending_reads = Arc::new(SyncMutex::new(HashSet::from([path.clone()])));
+
+        FsCacheEvictor::process_read(
+            inner.clone(),
+            pending_reads.clone(),
+            path,
+            512,
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await;
+
+        assert!(pending_reads.lock().is_empty());
+        assert!(inner.cache_state.lock().await.entries.is_empty());
+        assert_eq!(inner.cache_size_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_evictor_checks_read_existence_after_waiting_for_tracking_lock() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_evictor_read_delete_race_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let inner = Arc::new(FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        ));
+        let path = gen_rand_file(temp_dir.path(), "deleted-while-waiting", 16);
+        let pending_reads = Arc::new(SyncMutex::new(HashSet::from([path.clone()])));
+        let track_guard = inner.track_lock.lock().await;
+
+        let process = tokio::spawn(FsCacheEvictor::process_read(
+            inner.clone(),
+            pending_reads.clone(),
+            path.clone(),
+            16,
+            Arc::new(DefaultSystemClock::new()),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while pending_reads.lock().contains(&path) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::fs::remove_file(&path).await.unwrap();
+        drop(track_guard);
+        process.await.unwrap();
+
+        assert!(inner.cache_state.lock().await.entries.is_empty());
+        assert_eq!(inner.cache_size_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_evictor_dequeued_read_does_not_coalesce_a_newer_access() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_evictor_fresh_read_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let inner = Arc::new(FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        ));
+        let path = gen_rand_file(temp_dir.path(), "hot-file", 16);
+        let pending_reads = Arc::new(SyncMutex::new(HashSet::from([path.clone()])));
+        let track_guard = inner.track_lock.lock().await;
+
+        let process = tokio::spawn(FsCacheEvictor::process_read(
+            inner.clone(),
+            pending_reads.clone(),
+            path.clone(),
+            16,
+            Arc::new(DefaultSystemClock::new()),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while pending_reads.lock().contains(&path) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // This represents a read arriving while the dequeued update is still
+        // waiting for the inner tracker. It must remain independently pending.
+        assert!(pending_reads.lock().insert(path.clone()));
+        drop(track_guard);
+        process.await.unwrap();
+        assert!(pending_reads.lock().contains(&path));
+    }
+
+    #[tokio::test]
+    async fn test_evictor_read_pressure_does_not_block_cache_writes() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_evictor_isolated_mutations_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let evictor = FsCacheEvictor::new(
+            temp_dir.path().to_path_buf(),
+            1024,
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        );
+        evictor.started.store(true, Ordering::Release);
+
+        for idx in 0..EVICTOR_READ_QUEUE_CAPACITY {
+            assert!(
+                evictor
+                    .track_entry_accessed(
+                        std::path::PathBuf::from(format!("read-{idx}")),
+                        EntryAccess::Read(1),
+                    )
+                    .await
+            );
+        }
+        assert!(
+            !evictor
+                .track_entry_accessed(
+                    std::path::PathBuf::from("read-overflow"),
+                    EntryAccess::Read(1),
+                )
+                .await
+        );
+
+        assert!(
+            evictor
+                .track_entry_accessed(
+                    std::path::PathBuf::from("cache-write"),
+                    EntryAccess::Write(1),
+                )
+                .await
+        );
     }
 
     #[tokio::test]
